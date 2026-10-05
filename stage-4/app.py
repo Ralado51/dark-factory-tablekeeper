@@ -1737,6 +1737,21 @@ def revision_checkpoint(state,rid):
                 series={sid:s['revision'] for sid,s in state['series'].items() if state['reservations'][s['references'][0]]['restaurant_id']==rid},
                 plans=sorted(pid for pid,p in state.get('plans',{}).items() if p['restaurant_id']==rid and p['applied']))
 
+def grouped_revision_savings(state,versions,initial=None):
+    savings=0
+    for receipt in state['receipts']:
+        path=receipt['path'];response=receipt['response']
+        if path=='/reservation-moves':records=response.get('reservations',[])
+        elif re.fullmatch(r'/series/[^/]+/amend',path):records=[o['reservation'] for o in response.get('occurrences',[])]
+        else:continue
+        members_in_group=set()
+        for record in records:
+            ref=record.get('reference');rev=record.get('revision')
+            if ref in versions and type(rev) is int and (initial or {}).get(ref,1)<rev<=versions[ref] and state['histories'][ref][rev-1]['event']=='changed':
+                members_in_group.add(ref)
+        savings+=max(0,len(members_in_group)-1)
+    return savings
+
 def validate_baseline_counter(state,rid,checkpoint,counter):
     # Older formats do not distinguish individual writes from collective writes.
     # Count mandatory operations and the possible groupings of recorded changes.
@@ -1749,7 +1764,8 @@ def validate_baseline_counter(state,rid,checkpoint,counter):
         entries=state['histories'][ref][:version]
         mandatory+=sum(e['event']=='cancelled' for e in entries)
         changes.append(sum(e['event']=='changed' for e in entries))
-    if not mandatory+max(changes,default=0)<=counter<=mandatory+sum(changes):
+    minimum_changes=max(max(changes,default=0),sum(changes)-grouped_revision_savings(state,checkpoint['reservations']))
+    if not mandatory+minimum_changes<=counter<=mandatory+sum(changes):
         fail()
     for sid,revision in checkpoint['series'].items():
         original=next(r['response'] for r in state['receipts'] if r['path']=='/series' and r['response']['series_id']==sid)
@@ -1760,7 +1776,10 @@ def validate_baseline_counter(state,rid,checkpoint,counter):
             cancel_count+=sum(e['event']=='cancelled' for e in entries)
             repair_ids.update(e['plan_id'] for e in entries if e['event']=='reassigned')
             member_changes.append(sum(e['event']=='changed' for e in entries))
-        minimum=1+cancel_count+len(repair_ids)+max(member_changes,default=0)
+        initial={o['reference']:o['reservation']['revision'] for o in original['occurrences']}
+        versions={ref:checkpoint['reservations'][ref] for ref in initial}
+        minimum_changes=max(max(member_changes,default=0),sum(member_changes)-grouped_revision_savings(state,versions,initial))
+        minimum=1+cancel_count+len(repair_ids)+minimum_changes
         maximum=1+cancel_count+len(repair_ids)+sum(member_changes)
         if not minimum<=revision<=maximum:
             fail()

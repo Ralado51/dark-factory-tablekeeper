@@ -324,4 +324,16 @@ class Stage4(Stage3):
                 bad=copy.deepcopy(before);bad['state']['series'][s['series_id']]['revision']=value
                 self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
 
+    def test_legacy_individual_changes_cannot_be_counted_as_unrecorded_batch(self):
+        self.configure();a=self.create('a')[1];s=self.series(a['reference'])[1]
+        for o in s['occurrences'][:2]:
+            self.assertEqual(request(self.base,'PATCH','/reservations/'+o['reference'],{'party_size':1},self.token)[0],200)
+        snapshot=self.snapshot();legacy=copy.deepcopy(snapshot);legacy['state'].pop('revision_log')
+        self.assertEqual(request(self.dest,'POST','/_test/import',legacy)[0],204)
+        for field in ('restaurant','series'):
+            bad=copy.deepcopy(legacy)
+            if field=='restaurant':bad['state']['restaurant_revisions']['r1']-=1
+            else:bad['state']['series'][s['series_id']]['revision']-=1
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+
 if __name__=='__main__':unittest.main(defaultTest='Stage4',verbosity=2)
