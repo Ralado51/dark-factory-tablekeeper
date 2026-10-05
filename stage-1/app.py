@@ -475,9 +475,9 @@ def route(method, path, query, body, headers):
         return 204, None
     if method == "POST" and path in ("/auth/signup", "/auth/login"):
         email, password = field(body, "email"), field(body, "password")
+        email_valid(email)
         if path == "/auth/signup":
             display = field(body, "display_name")
-            email_valid(email)
             if len(password) < 8:
                 fail()
             if any(u["email"] == email for u in state["users"].values()):

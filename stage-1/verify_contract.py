@@ -163,6 +163,21 @@ class Contract(unittest.TestCase):
                                 {"starts_at_local": DAY+"T12:30"}, self.token), 409, "table_unavailable")
         self.assertEqual(snapshot, request(self.base, "GET", "/_test/export")[1])
 
+    def test_login_email_format_precedes_credentials_and_preserves_state(self):
+        before = request(self.base, "GET", "/_test/export")[1]
+        for email in ("missing-at", "@domain", "local@", "a@@b", "a b@c", "", "local@do main"):
+            self.check_error(request(self.base, "POST", "/auth/login",
+                                    {"email": email, "password": "password"}), 422, "validation_failed")
+        self.check_error(request(self.base, "POST", "/auth/login",
+                                {"email": "unknown@example.com", "password": "password"}), 401, "unauthenticated")
+        self.check_error(request(self.base, "POST", "/auth/login",
+                                {"email": "one@example.com", "password": "incorrect"}), 401, "unauthenticated")
+        self.check_error(request(self.base, "POST", "/auth/login",
+                                {"email": False, "password": "password"}), 400, "malformed_request")
+        self.assertEqual(request(self.base, "GET", "/_test/export")[1], before)
+        self.assertEqual(request(self.base, "POST", "/auth/login",
+                                {"email": "one@example.com", "password": "password1"})[0], 200)
+
     def test_owner_privacy_and_auth_sessions(self):
         a = self.create("a")[1]
         path = "/reservations/"+a["reference"]
