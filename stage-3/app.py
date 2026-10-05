@@ -948,6 +948,52 @@ def retry(state, uid, method, path, body, headers):
 def save_receipt(state, identity, body, response):
     state['receipts'].append(dict(zip(('user_id','method','path','key'), identity), body=copy.deepcopy(body), response=copy.deepcopy(response)))
 
+
+def validate_saved_reservation(state, item, uid, creation=False):
+    if not isinstance(item, dict) or item.get('reference') not in state['reservations']:
+        fail()
+    current = state['reservations'][item['reference']]
+    if current['user_id'] != uid or item.get('status') != 'confirmed':
+        fail()
+    for name in ('reservation_id', 'restaurant_id', 'created_at'):
+        if item.get(name) != current[name]:
+            fail()
+    enhanced = 'revision' in item or 'accepted_terms' in item
+    shape = {k: v for k, v in item.items() if k not in ('revision', 'accepted_terms')}
+    valid_record_shape(shape)
+    r = state['restaurants'][current['restaurant_id']]
+    if enhanced:
+        if 'revision' not in item or 'accepted_terms' not in item:
+            fail()
+        revision = bounded(item['revision'], 1, current['revision'])
+        if creation and revision != 1:
+            fail()
+        historical = state['histories'][item['reference']][revision - 1]
+        if historical['event'] == 'cancelled' or not json_equal(item['accepted_terms'], historical['accepted_terms']):
+            fail()
+        # Reconstruct the seating/time/party values at the frozen revision.
+        values = {}
+        for event in state['histories'][item['reference']][:revision]:
+            for change in event['changes']:
+                key = change['field']
+                if key == 'table_id':
+                    values['table_ids'] = [change['to']]
+                else:
+                    values[key] = change['to']
+        if members(item) != values.get('table_ids') or any(item.get(k) != values.get(k) for k in ('starts_at_local','party_size')):
+            fail()
+        terms = item['accepted_terms']
+    else:
+        # Migrated Stage 1/2 receipts deliberately retain their original schema.
+        terms = terms_zero(r)
+    expected = proposed(state, current['restaurant_id'], dict(table_ids=members(item),
+                        starts_at_local=item['starts_at_local'], party_size=item['party_size']), frozen=terms)
+    expected.pop('revision')
+    if not enhanced:
+        expected.pop('accepted_terms')
+    if not fields_match(expected, item):
+        fail()
+
 def valid_snapshot(raw):
     global build_fixture, proposed
     try:
@@ -989,7 +1035,7 @@ def valid_snapshot(raw):
             if not isinstance(policies,list):
                 fail()
             for version,p in enumerate(policies,1):
-                if p != dict(policy_body(r,p), policy_version=version):
+                if not json_equal(p, dict(policy_body(r,p), policy_version=version)):
                     fail()
         if set(result['histories']) != set(result['reservations']):
             fail()
@@ -1008,7 +1054,7 @@ def valid_snapshot(raw):
             config=restaurant(result,r['restaurant_id'])
             terms=r['accepted_terms']
             known=[terms_zero(config)]+[{k:v for k,v in p.items() if k!='effective_from'} for p in result['policies'][config['id']]]
-            if terms not in known:
+            if not any(json_equal(terms, p) for p in known):
                 fail()
             expected=proposed(result,r['restaurant_id'],dict(table_ids=members(r), starts_at_local=r['starts_at_local'],party_size=r['party_size']), frozen=terms)
             expected.pop('revision')
@@ -1019,10 +1065,10 @@ def valid_snapshot(raw):
                 fail()
             prior=None
             for seq,e in enumerate(entries,1):
-                if set(e)!={'seq','at','event','changes','revision','accepted_terms'} or e['seq']!=seq or e['revision']!=seq:
+                if set(e)!={'seq','at','event','changes','revision','accepted_terms'} or type(e['seq']) is not int or type(e['revision']) is not int or e['seq']!=seq or e['revision']!=seq:
                     fail()
                 instant=datetime.fromisoformat(e['at'])
-                if instant.tzinfo is None or (prior is not None and instant<prior) or e['accepted_terms'] not in known:
+                if instant.tzinfo is None or (prior is not None and instant<prior) or not any(json_equal(e['accepted_terms'], p) for p in known):
                     fail()
                 if e['event'] not in ('created','changed','cancelled') or (seq>1 and e['event']=='created') or (e['event']=='cancelled' and seq!=len(entries)):
                     fail()
@@ -1042,7 +1088,7 @@ def valid_snapshot(raw):
                     if set(c)!={'field','from','to'} or (e['event']=='created' and c['from'] is not None) or (e['event']=='changed' and c['from']==c['to']):
                         fail()
                 prior=instant
-            if entries[-1]['revision']!=r['revision'] or entries[-1]['accepted_terms']!=terms:
+            if entries[-1]['revision']!=r['revision'] or not json_equal(entries[-1]['accepted_terms'],terms):
                 fail()
         occupancy(empty_state(),list(result['reservations'].values()))
         adopted=set()
@@ -1081,28 +1127,66 @@ def valid_snapshot(raw):
                 items=[response] if path=='/reservations' else response.get('reservations')
                 if not isinstance(items,list) or not 1<=len(items)<=8:
                     fail()
-                for item in items:
-                    if not isinstance(item,dict) or item.get('reference') not in result['reservations']:
+                if path=='/reservation-moves':
+                    moves=receipt['body'].get('moves')
+                    if not isinstance(moves,list) or len(moves)!=len(items) or any(not isinstance(move,dict) for move in moves):
                         fail()
-                    current=result['reservations'][item['reference']]
-                    if current['user_id']!=receipt['user_id'] or item.get('status')!='confirmed':
+                    if [move.get('reference') for move in moves]!=[item.get('reference') for item in items]:
                         fail()
-                    for name in ('reservation_id','restaurant_id','created_at'):
-                        if item.get(name)!=current[name]:
+                    for move,item in zip(moves,items):
+                        if 'revision' not in item and 'accepted_terms' not in item:
+                            continue
+                        r=result['restaurants'][item['restaurant_id']]
+                        if 'table_id' in move or 'table_ids' in move:
+                            if seating(r,move)[0]!=members(item):
+                                fail()
+                        if 'party_size' in move and party(move['party_size'])!=item['party_size']:
                             fail()
-                    terms=item.get('accepted_terms',terms_zero(result['restaurants'][current['restaurant_id']]))
-                    expected=proposed(result,current['restaurant_id'],dict(table_ids=members(item),starts_at_local=item['starts_at_local'],party_size=item['party_size']),frozen=terms)
+                        if 'starts_at_local' in move and move['starts_at_local']!=item['starts_at_local']:
+                            fail()
+                        if 'expected_revision' in move:
+                            expected_revision=bounded(move['expected_revision'],1,float('inf'))
+                            if expected_revision not in (item.get('revision'),item.get('revision',0)-1):
+                                fail()
+                elif 'revision' in items[0] or 'accepted_terms' in items[0]:
+                    item=items[0]
+                    if receipt['body'].get('restaurant_id')!=item['restaurant_id']:
+                        fail()
+                    terms=item.get('accepted_terms',terms_zero(result['restaurants'][item['restaurant_id']]))
+                    expected=proposed(result,item['restaurant_id'],receipt['body'],frozen=terms)
                     expected.pop('revision')
                     if 'accepted_terms' not in item:
                         expected.pop('accepted_terms')
                     if not fields_match(expected,item):
                         fail()
+                for item in items:
+                    validate_saved_reservation(result,item,receipt['user_id'],creation=path=='/reservations')
             elif path=='/series':
                 if response.get('series_id') not in result['series']:
                     fail()
+                series=result['series'][response['series_id']]
+                if set(response)!={'series_id','revision','interval_weeks','occurrences'} or series['user_id']!=receipt['user_id']:
+                    fail()
+                if bounded(response['revision'],1,1)!=1 or bounded(response['interval_weeks'],1,4)!=series['interval_weeks']:
+                    fail()
+                occurrences=response['occurrences']
+                if not isinstance(occurrences,list) or len(occurrences)!=len(series['references']):
+                    fail()
+                if receipt['body'].get('anchor_reference')!=series['references'][0] or bounded(receipt['body'].get('count'),2,12)!=len(occurrences) or bounded(receipt['body'].get('interval_weeks'),1,4)!=series['interval_weeks']:
+                    fail()
+                for index,occurrence in enumerate(occurrences):
+                    if not isinstance(occurrence,dict) or set(occurrence)!={'index','reference','exception','reservation'}:
+                        fail()
+                    if type(occurrence['index']) is not int or occurrence['index']!=index or occurrence['reference']!=series['references'][index] or occurrence['exception'] is not False:
+                        fail()
+                    if not isinstance(occurrence['reservation'],dict) or 'revision' not in occurrence['reservation'] or 'accepted_terms' not in occurrence['reservation'] or occurrence['reservation'].get('reference')!=occurrence['reference']:
+                        fail()
+                    validate_saved_reservation(result,occurrence['reservation'],receipt['user_id'],creation=index>0)
             else:
                 rid=unquote(path.split('/')[2])
-                if response not in result['policies'].get(rid,[]):
+                if not any(json_equal(response, p) for p in result['policies'].get(rid, [])):
+                    fail()
+                if not json_equal({k:v for k,v in response.items() if k!='policy_version'}, policy_body(result['restaurants'][rid],receipt['body'])):
                     fail()
         return result
     except (APIError,KeyError,ValueError,TypeError,OverflowError,AttributeError):

@@ -200,4 +200,99 @@ class Stage3(Stage2):
         self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed')
         self.assertEqual(self.snapshot(),original)
 
+    def test_corrupt_creation_receipt_revisions_import_rolls_back(self):
+        self.configure(); body=self.booking(); original=self.create('receipt',body)[1]
+        snapshot=self.snapshot()
+        for value in (0,-1,True,False,'1',None,1.5,2,999):
+            bad=copy.deepcopy(snapshot); bad['state']['receipts'][0]['response']['revision']=value
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed')
+            self.assertEqual(self.snapshot(),snapshot)
+            self.assertEqual(self.create('receipt',body),(200,original))
+        for missing in ('revision','accepted_terms'):
+            bad=copy.deepcopy(snapshot);del bad['state']['receipts'][0]['response'][missing]
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed')
+            self.assertEqual(self.snapshot(),snapshot)
+        # Frozen creation revision and terms remain legitimate after newer edits/policies.
+        self.publish('future',self.policy(reservation_duration_minutes=120))
+        request(self.base,'PATCH','/reservations/'+original['reference'],{'table_id':'t2'},self.token)
+        request(self.base,'POST','/reservations/'+original['reference']+'/cancel',{},self.token)
+        changed=self.snapshot()
+        self.assertEqual(request(self.dest,'POST','/_test/import',changed)[0],204)
+        self.assertEqual(request(self.dest,'POST','/reservations',body,self.token,'receipt'),(200,original))
+        self.assertEqual(request(self.dest,'GET','/_test/export')[1],changed)
+    def test_corrupt_batch_and_series_receipts_rejected_frozen_receipts_preserved(self):
+        self.configure(); original=self.create('pair',self.pair_body())[1]
+        batch={'moves':[{'reference':original['reference'],'table_ids':['t3','t4']}]}
+        moved=request(self.base,'POST','/reservation-moves',batch,self.token,'moved')[1]
+        adopted=self.series(original['reference'])[1]
+        # Change and cancel current state without rewriting saved batch/series receipts.
+        request(self.base,'PATCH','/reservations/'+original['reference'],{'party_size':6},self.token)
+        request(self.base,'POST','/reservations/'+adopted['occurrences'][1]['reference']+'/cancel',{},self.token)
+        snapshot=self.snapshot()
+        self.assertEqual(request(self.dest,'POST','/_test/import',snapshot)[0],204)
+        self.assertEqual(request(self.dest,'POST','/reservation-moves',batch,self.token,'moved'),(200,moved))
+        self.assertEqual(request(self.dest,'POST','/series',{'anchor_reference':original['reference'],'count':3,'interval_weeks':1},self.token,'series'),(200,adopted))
+        for path in ('/reservation-moves','/series'):
+            index=next(i for i,r in enumerate(snapshot['state']['receipts']) if r['path']==path)
+            for value in (0,-1,True,'1',1.5,999):
+                bad=copy.deepcopy(snapshot);response=bad['state']['receipts'][index]['response']
+                if path=='/reservation-moves': response['reservations'][0]['revision']=value
+                else: response['revision']=value
+                self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed')
+                self.assertEqual(self.snapshot(),snapshot)
+            bad=copy.deepcopy(snapshot); response=bad['state']['receipts'][index]['response']
+            item=response['reservations'][0] if path=='/reservation-moves' else response['occurrences'][1]['reservation']
+            item['revision']=0
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed')
+            self.assertEqual(self.snapshot(),snapshot)
+            bad=copy.deepcopy(snapshot);response=bad['state']['receipts'][index]['response']
+            item=response['reservations'][0] if path=='/reservation-moves' else response['occurrences'][0]['reservation']
+            item['accepted_terms']['policy_version']=True
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed')
+            self.assertEqual(self.snapshot(),snapshot)
+    def test_corrupt_policy_receipt_and_historical_payload_types(self):
+        self.configure(); published=self.publish('p')[1]; original=self.create('booking')[1]; snapshot=self.snapshot()
+        policy_index=next(i for i,r in enumerate(snapshot['state']['receipts']) if r['path'].endswith('/policies'))
+        booking_index=next(i for i,r in enumerate(snapshot['state']['receipts']) if r['path']=='/reservations')
+        for value in (0,True,'1',1.5,2):
+            bad=copy.deepcopy(snapshot);bad['state']['receipts'][policy_index]['response']['policy_version']=value
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+        for field,value in [('party_size',1),('starts_at_local',DAY+'T13:00'),('table_ids',['t2'])]:
+            bad=copy.deepcopy(snapshot);bad['state']['receipts'][booking_index]['response'][field]=value
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+        bad=copy.deepcopy(snapshot);bad['state']['receipts'][booking_index]['body']['party_size']=1
+        self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+        bad=copy.deepcopy(snapshot);bad['state']['receipts'][policy_index]['body']['slot_minutes']=60
+        self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+        bad=copy.deepcopy(snapshot);bad['state']['policies']['r1'][0]['policy_version']=True
+        self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+        self.assertEqual(request(self.dest,'POST','/_test/import',snapshot)[0],204)
+        self.assertEqual(request(self.dest,'POST','/restaurants/r1/policies',self.policy(),self.token,'p'),(200,published))
+
+    def test_legacy_unknown_fields_receipts_survive_second_import(self):
+        for source in ('stage-1','stage-2'):
+            number=port(); app=Path('/'+source+'/app.py')
+            if not app.exists(): app=Path(__file__).parent.parent/source/'app.py'
+            process=subprocess.Popen([sys.executable,str(app)],env=dict(os.environ,PORT=str(number),PYTHONDONTWRITEBYTECODE='1'),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            base=f'http://127.0.0.1:{number}'
+            try:
+                for _ in range(100):
+                    try:
+                        if request(base,'GET','/health')[0]==200: break
+                    except OSError: time.sleep(.05)
+                request(base,'POST','/_test/reset',fixture())
+                token=request(base,'POST','/auth/login',{'email':'one@example.com','password':'password1'})[1]['token']
+                body=self.booking(expected_revision=True)
+                if source=='stage-1': body['table_ids']='ignored-before-stage-2'
+                original=request(base,'POST','/reservations',body,token,'old-create')[1]
+                batch={'moves':[{'reference':original['reference'],'table_id':'t2','expected_revision':True}]}
+                moved=request(base,'POST','/reservation-moves',batch,token,'old-batch')[1]
+                exported=request(base,'GET','/_test/export')[1]
+                self.assertEqual(request(self.base,'POST','/_test/import',exported)[0],204)
+                migrated=self.snapshot()
+                self.assertEqual(request(self.dest,'POST','/_test/import',migrated)[0],204)
+                self.assertEqual(request(self.dest,'POST','/reservations',body,token,'old-create'),(200,original))
+                self.assertEqual(request(self.dest,'POST','/reservation-moves',batch,token,'old-batch'),(200,moved))
+            finally: process.terminate();process.wait(timeout=5)
+
 if __name__=='__main__': unittest.main(defaultTest='Stage3',verbosity=2)
