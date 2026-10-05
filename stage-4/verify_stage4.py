@@ -336,4 +336,16 @@ class Stage4(Stage3):
             else:bad['state']['series'][s['series_id']]['revision']-=1
             self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
 
+    def test_native_revision_events_require_original_completed_receipts(self):
+        self.configure();a=self.create('a')[1];s=self.series(a['reference'])[1];self.publish('policy')
+        plan=self.replan()[1];self.apply(plan)
+        s=request(self.base,'GET','/series/'+s['series_id'],token=self.token)[1];self.amend_series(s)
+        snapshot=self.snapshot()
+        for receipt in snapshot['state']['receipts']:
+            bad=copy.deepcopy(snapshot)
+            bad['state']['receipts']=[r for r in bad['state']['receipts'] if (r['user_id'],r['method'],r['path'],r['key'])!=(receipt['user_id'],receipt['method'],receipt['path'],receipt['key'])]
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+        bad=copy.deepcopy(snapshot);bad['state']['revision_log']['r1']['events'][0]['receipt'][-1]='missing'
+        self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+
 if __name__=='__main__':unittest.main(defaultTest='Stage4',verbosity=2)

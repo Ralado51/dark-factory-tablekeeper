@@ -1720,6 +1720,14 @@ def valid_snapshot(raw):
                         current=result['reservations'][o['reference']]
                         if record['status']!='cancelled' or not json_equal(record,public_reservation(current)):
                             fail()
+        for pid,plan in result['plans'].items():
+            previews=[];applications=[]
+            for receipt in result['receipts']:
+                match=re.fullmatch(r'/restaurants/([^/]+)/replans(?:/([^/]+)/apply)?',receipt['path'])
+                if match is not None and unquote(match[1])==plan['restaurant_id'] and receipt['response'].get('plan_id')==pid:
+                    (applications if match[2] is not None else previews).append(receipt)
+            if len(previews)!=1 or previews[0]['user_id']!=plan['user_id'] or len(applications)!=int(plan['applied']):
+                fail()
         initialize_revision_log(result)
         validate_revision_log(result)
         for plan in result['plans'].values():
@@ -1803,7 +1811,9 @@ def route(method,path,query,body,headers):
                     if current!=previous+1:
                         fail()
                     old=revision_checkpoint(before,rid);new=revision_checkpoint(STATE,rid)
-                    event=dict(method=method,path=path,
+                    added_receipts=STATE['receipts'][len(before['receipts']):]
+                    receipt=added_receipts[0] if added_receipts else None
+                    event=dict(method=method,path=path,receipt=([receipt[k] for k in ('user_id','method','path','key')] if receipt is not None else None),
                                reservations={ref:rev for ref,rev in new['reservations'].items() if old['reservations'].get(ref)!=rev},
                                policies=new['policies'],
                                series={sid:rev for sid,rev in new['series'].items() if old['series'].get(sid)!=rev},
@@ -1840,7 +1850,7 @@ def validate_revision_log(state):
         check_point(checkpoint);validate_baseline_counter(state,rid,checkpoint,base)
         checkpoints={base:copy.deepcopy(checkpoint)}
         for event in log['events']:
-            if not isinstance(event,dict) or set(event)!={'method','path','reservations','policies','series','plans'} or not isinstance(event['path'],str) or event['method'] not in ('POST','PATCH') or not isinstance(event['reservations'],dict) or not isinstance(event['series'],dict) or not isinstance(event['plans'],list):
+            if not isinstance(event,dict) or set(event)!={'method','path','receipt','reservations','policies','series','plans'} or not isinstance(event['path'],str) or event['method'] not in ('POST','PATCH') or not isinstance(event['reservations'],dict) or not isinstance(event['series'],dict) or not isinstance(event['plans'],list):
                 fail()
             old=copy.deepcopy(checkpoint)
             for ref,rev in event['reservations'].items():
@@ -1856,17 +1866,36 @@ def validate_revision_log(state):
             checkpoint['policies']=event['policies'];checkpoint['plans']=sorted(checkpoint['plans']+event['plans'])
             check_point(checkpoint)
             path=event['path'];refs=event['reservations']
+            idempotent=path in ('/reservations','/series','/reservation-moves') or bool(re.fullmatch(r'/restaurants/[^/]+/(policies|replans/[^/]+/apply)|/series/[^/]+/amend',path))
+            receipt=None
+            if idempotent:
+                identity=event['receipt']
+                if not isinstance(identity,list) or len(identity)!=4 or identity[1:3]!=[event['method'],path]:
+                    fail()
+                receipt=next((r for r in state['receipts'] if [r[k] for k in ('user_id','method','path','key')]==identity),None)
+                if receipt is None:
+                    fail()
+                response=receipt['response']
+                if path=='/reservations':records=[response]
+                elif path=='/reservation-moves' or path.endswith('/apply'):records=response['reservations']
+                elif path=='/series' or path.endswith('/amend'):records=[o['reservation'] for o in response['occurrences']]
+                else:records=[]
+                saved={r['reference']:r.get('revision',1) for r in records}
+                if any(saved.get(ref)!=rev for ref,rev in refs.items()):
+                    fail()
+            elif event['receipt'] is not None:
+                fail()
             events=[state['histories'][ref][rev-1]['event'] for ref,rev in refs.items()]
             if path=='/reservations':
                 good=event['method']=='POST' and len(refs)==1 and events==['created']
             elif path=='/series':
                 good=event['method']=='POST' and len(event['series'])==1 and all(e=='created' for e in events)
             elif re.fullmatch(r'/restaurants/[^/]+/policies',path):
-                good=event['method']=='POST' and not refs and checkpoint['policies']==old['policies']+1
+                good=event['method']=='POST' and not refs and checkpoint['policies']==old['policies']+1 and response['policy_version']==checkpoint['policies'] and unquote(path.split('/')[2])==rid
             elif re.fullmatch(r'/restaurants/[^/]+/replans/[^/]+/apply',path):
                 good=event['method']=='POST' and len(event['plans'])==1 and all(e=='reassigned' for e in events)
                 plan=state['plans'][unquote(path.split('/')[4])]
-                good=good and event['plans']==[plan['plan_id']] and set(refs)=={a['reference'] for a in plan['assignments'] if a['changed']}
+                good=good and response['plan_id']==plan['plan_id'] and response['restaurant_revision']==base+len(checkpoints) and event['plans']==[plan['plan_id']] and set(refs)=={a['reference'] for a in plan['assignments'] if a['changed']}
             elif path=='/reservation-moves' or re.fullmatch(r'/series/[^/]+/amend',path):
                 good=event['method']=='POST' and bool(refs) and all(e=='changed' for e in events)
             elif re.fullmatch(r'/reservations/[^/]+/cancel',path):
@@ -1881,7 +1910,10 @@ def validate_revision_log(state):
                 good=False
             if path=='/series':
                 sid=next(iter(event['series']),None)
-                good=good and sid is not None and sid not in old['series'] and set(refs)==set(state['series'][sid]['references'][1:])
+                good=good and sid is not None and response['series_id']==sid and sid not in old['series'] and set(refs)==set(state['series'][sid]['references'][1:])
+            elif path.endswith('/amend'):
+                sid=unquote(path.split('/')[2])
+                good=good and set(event['series'])=={sid} and response['series_id']==sid and response['revision']==event['series'][sid]
             else:
                 affected={sid for sid,s in state['series'].items() if sid in old['series'] and set(refs)&set(s['references'])}
                 good=good and set(event['series'])==affected
