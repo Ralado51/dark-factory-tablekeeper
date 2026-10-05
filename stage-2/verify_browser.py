@@ -39,7 +39,10 @@ def product_fixture():
 
 
 processes, bases = [], []
-for app in [Path(__file__).with_name("app.py"), Path(__file__).parent.parent/"stage-1"/"app.py"]:
+for index, app in enumerate([Path(__file__).with_name("app.py"), Path(__file__).parent.parent/"stage-1"/"app.py"]):
+    if index == 0 and os.environ.get("BROWSER_STAGE2_URL"):
+        bases.append(os.environ["BROWSER_STAGE2_URL"])
+        continue
     number = port()
     process = subprocess.Popen([sys.executable,str(app)],env=dict(os.environ,PORT=str(number),PYTHONDONTWRITEBYTECODE="1"),
                                stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
@@ -139,6 +142,10 @@ try:
         expect(page.get_by_test_id("booking-uncertain")).to_be_visible()
         check(page.get_by_test_id("booking-error").count()==0 and page.get_by_test_id("confirmation").count()==0,
               "Lost pair response shows uncertainty without error or confirmation")
+        page.evaluate("window.savedBookingForm=document.querySelector('[data-testid=booking-form]')")
+        page.get_by_test_id("slot-t2+t1-12:00").click()
+        expect(page.get_by_test_id("booking-uncertain")).to_be_visible()
+        check(page.evaluate("window.savedBookingForm===document.querySelector('[data-testid=booking-form]')"),"Unchanged pair reselection retains exact form DOM and uncertainty")
         unchanged=page.get_by_test_id("booking-party-size").input_value()
         snapshot=request(base,"GET","/_test/export")[1]
         request(base,"POST","/_test/reset",product_fixture())
@@ -155,6 +162,9 @@ try:
               "Successful pair retry clears both uncertainty and error")
         expect(page.get_by_test_id("confirmation-tables")).to_contain_text("Garden")
         expect(page.get_by_test_id("confirmation-tables")).to_contain_text("Window")
+        page.get_by_test_id("slot-t2+t1-12:00").click()
+        expect(page.get_by_test_id("confirmation-reference")).to_have_text(originals[-1]["reference"])
+        check(page.get_by_test_id("confirmation").is_visible(),"Unchanged pair reselection retains successful confirmation")
         page.get_by_test_id("booking-submit").click()
         expect(page.get_by_test_id("confirmation-reference")).to_have_text(originals[-1]["reference"])
         check(submissions[-1]==submissions[-2],"Unchanged success resubmission preserves retry identity")
@@ -195,6 +205,10 @@ try:
         mode["drop"]=True
         page.get_by_test_id("booking-submit").click()
         expect(page.get_by_test_id("booking-uncertain")).to_be_visible()
+        page.evaluate("window.savedBookingForm=document.querySelector('[data-testid=booking-form]')")
+        page.get_by_test_id("slot-t1-12:00").click()
+        expect(page.get_by_test_id("booking-uncertain")).to_be_visible()
+        check(page.evaluate("window.savedBookingForm===document.querySelector('[data-testid=booking-form]')"),"Unchanged single reselection retains exact form DOM and uncertainty")
         legacy_reference=originals[-1]["reference"]
         current_token=page.evaluate("JSON.parse(localStorage.getItem('gather-user')).token")
         exported=request(legacy,"GET","/_test/export")[1]

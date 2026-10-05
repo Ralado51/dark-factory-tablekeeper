@@ -175,6 +175,14 @@ function addSeat(parent, slot, ids, capacity, available, pair) {
   if (selection && selection.restaurant.id===result.restaurant.id && selection.slot.starts_at_local===slot.starts_at_local && JSON.stringify(selection.ids)===JSON.stringify(ids)) button.classList.add("selected");
   button.onclick=()=>{
     if(!user) {feedback($("#search-form"),"auth-error","Please sign in before booking your table."); $('[data-testid="auth-error"]').scrollIntoView({block:"center"}); return;}
+    // Reselecting the same option changes no booking values: retain the live
+    // form, edited party size, feedback, in-flight selection and receipt identity.
+    if (selection && selection.restaurant.id===result.restaurant.id &&
+        selection.slot.starts_at_local===slot.starts_at_local &&
+        JSON.stringify(selection.ids)===JSON.stringify(ids) && $("#booking-form")) {
+      if(innerWidth<=620) $("#booking-form").scrollIntoView({block:"start"});
+      return;
+    }
     selection={restaurant:result.restaurant,slot,ids:[...ids],party:result.q.party_size}; pending=null;
     document.querySelectorAll(".seat.selected").forEach(el=>el.classList.remove("selected")); button.classList.add("selected");
     bookingForm();
