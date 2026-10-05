@@ -257,4 +257,71 @@ class Stage4(Stage3):
         self.assertEqual(self.apply(p2,'next-apply')[0],201)
         self.assertEqual(request(self.dest,'POST','/_test/import',self.snapshot())[0],204)
 
+    def test_counter_corruption_cannot_revive_stale_empty_preview(self):
+        self.configure();self.create('first');plan=self.replan(start=DAY+'T13:00:00Z',end=DAY+'T14:00:00Z')[1]
+        self.assertEqual(plan['assignments'],[])
+        self.create('second',self.booking('t1',DAY+'T13:00'));snapshot=self.snapshot()
+        self.check_error(self.apply(plan),409,'stale_plan')
+        for value in (0,1,3,True,'2',None):
+            bad=copy.deepcopy(snapshot);bad['state']['restaurant_revisions']['r1']=value
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+            self.check_error(self.apply(plan),409,'stale_plan')
+        self.assertEqual(request(self.dest,'POST','/_test/import',snapshot)[0],204)
+        self.check_error(request(self.dest,'POST','/restaurants/r1/replans/'+plan['plan_id']+'/apply',{},self.token,'apply'),409,'stale_plan')
+        # Rejected-revision exports without the new provenance still cannot be revived.
+        legacy=copy.deepcopy(snapshot);legacy['state'].pop('revision_log')
+        for old_plan in legacy['state']['plans'].values():old_plan['context'].pop('checkpoint',None)
+        self.assertEqual(request(self.dest,'POST','/_test/import',legacy)[0],204)
+        legacy['state']['restaurant_revisions']['r1']=1
+        self.check_error(request(self.base,'POST','/_test/import',legacy),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+    def test_counter_provenance_and_preview_context_corruption(self):
+        self.configure();a=self.create('a')[1];plan=self.replan()[1];fresh=self.snapshot()
+        for kind in ('context','checkpoint','base','event','missing','policy','series'):
+            bad=copy.deepcopy(fresh);log=bad['state']['revision_log']['r1']
+            if kind=='context':bad['state']['plans'][plan['plan_id']]['context']['reservations'].clear();bad['state']['plans'][plan['plan_id']]['bookings']=[];bad['state']['plans'][plan['plan_id']]['assignments']=[];bad['state']['plans'][plan['plan_id']]['moved_count']=0;bad['state']['plans'][plan['plan_id']]['unused_seats']=0
+            if kind=='checkpoint':bad['state']['plans'][plan['plan_id']]['context']['checkpoint']['policies']=1
+            if kind=='base':log['base']=1
+            if kind=='event':log['events'][0]['reservations'][a['reference']]=2
+            if kind=='missing':log['events'].clear()
+            if kind=='policy':log['events'][0]['policies']=True
+            if kind=='series':log['events'][0]['series']={'missing':1}
+            self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),fresh)
+        self.assertEqual(request(self.dest,'POST','/_test/import',fresh)[0],204)
+        self.assertEqual(self.apply(plan)[0],201);applied=self.snapshot()
+        self.assertEqual(request(self.dest,'POST','/_test/import',applied)[0],204)
+        bad=copy.deepcopy(applied);bad['state']['revision_log']['r1']['events'][-1]['plans']=[]
+        self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),applied)
+
+    def test_apply_readers_only_observe_complete_old_or_new_series_assignments(self):
+        self.configure();a=self.create('a')[1];s=self.series(a['reference'])[1]
+        plan=self.replan(start=DAY+'T00:00:00Z',end='2030-01-22T00:00:00Z')[1]
+        refs={o['reference'] for o in s['occurrences']}
+        old={o['reference']:tuple(o['reservation']['table_ids']) for o in s['occurrences']}
+        new={x['reference']:tuple(x['table_ids']) for x in plan['assignments']}
+        def read():
+            snapshots=[]
+            for _ in range(8):
+                status,body=request(self.base,'GET','/reservations',token=self.token)
+                self.assertEqual(status,200)
+                snapshots.append({r['reference']:tuple(r['table_ids']) for r in body['reservations'] if r['reference'] in refs})
+            return snapshots
+        with concurrent.futures.ThreadPoolExecutor(max_workers=11) as pool:
+            readers=[pool.submit(read) for _ in range(10)]
+            self.assertEqual(pool.submit(self.apply,plan).result()[0],201)
+            for reader in readers:
+                for snap in reader.result():self.assertIn(snap,(old,new))
+        self.assertEqual(request(self.dest,'POST','/_test/import',self.snapshot())[0],204)
+
+    def test_series_counter_corruption_and_legacy_baseline_validation(self):
+        self.configure();a=self.create('a')[1];s=self.series(a['reference'])[1]
+        request(self.base,'PATCH','/reservations/'+a['reference'],{'party_size':1},self.token)
+        snapshot=self.snapshot()
+        for legacy in (False,True):
+            before=copy.deepcopy(snapshot)
+            if legacy:before['state'].pop('revision_log')
+            self.assertEqual(request(self.dest,'POST','/_test/import',before)[0],204)
+            for value in (1,3,True):
+                bad=copy.deepcopy(before);bad['state']['series'][s['series_id']]['revision']=value
+                self.check_error(request(self.base,'POST','/_test/import',bad),422,'validation_failed');self.assertEqual(self.snapshot(),snapshot)
+
 if __name__=='__main__':unittest.main(defaultTest='Stage4',verbosity=2)

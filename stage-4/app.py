@@ -1367,7 +1367,7 @@ def initialize_final(state):
     return state
 
 def build_fixture(body):
-    return initialize_final(stage3_fixture(body))
+    return initialize_revision_log(initialize_final(stage3_fixture(body)))
 
 def availability(state,query):
     response=stage3_availability(state,query)
@@ -1442,6 +1442,10 @@ def optimize(state,r,closure):
     assignments=[dict(reference=b['reference'],table_ids=members(candidate),changed=set(members(candidate))!=set(members(b))) for b,candidate in zip(bookings,best_records)]
     return copy.deepcopy(bookings),assignments,best[0],best[1]
 
+def plan_context_matches(state,plan):
+    rid=plan['restaurant_id']
+    return ('checkpoint' not in plan['context'] or json_equal(plan['context']['checkpoint'],revision_checkpoint(state,rid))) and json_equal(plan['context']['reservations'],{ref:r for ref,r in state['reservations'].items() if r['restaurant_id']==rid}) and json_equal(plan['context']['closures'],state['closures'][rid])
+
 def plan_public(plan):
     return {key:copy.deepcopy(plan[key]) for key in ('plan_id','restaurant_revision','closure','assignments','moved_count','unused_seats')}
 
@@ -1477,7 +1481,7 @@ def stage3_route(method,path,query,body,headers):
             pid='plan_'+secrets.token_hex(16)
             plan=dict(plan_id=pid,restaurant_id=rid,user_id=uid,restaurant_revision=state['restaurant_revisions'][rid],closure=closure,
                       assignments=assignments,moved_count=moved,unused_seats=unused,bookings=bookings,applied=False,
-                      context=dict(reservations=copy.deepcopy({ref:b for ref,b in state['reservations'].items() if b['restaurant_id']==rid}),closures=copy.deepcopy(state['closures'][rid])))
+                      context=dict(checkpoint=revision_checkpoint(state,rid),reservations=copy.deepcopy({ref:b for ref,b in state['reservations'].items() if b['restaurant_id']==rid}),closures=copy.deepcopy(state['closures'][rid])))
             state['plans'][pid]=plan
             response=plan_public(plan)
         else:
@@ -1486,8 +1490,14 @@ def stage3_route(method,path,query,body,headers):
                 fail('not_found',404)
             if plan['applied']:
                 fail('plan_already_applied',409)
-            if state['restaurant_revisions'][rid]!=plan['restaurant_revision']:
+            if state['restaurant_revisions'][rid]!=plan['restaurant_revision'] or not plan_context_matches(state,plan):
                 fail('stale_plan',409)
+            # Validate the complete proposed occupancy before changing any record.
+            view=copy.deepcopy(state)
+            for assignment in plan['assignments']:
+                view['reservations'][assignment['reference']]=set_tables(view['reservations'][assignment['reference']],assignment['table_ids'])
+            view['closures'][rid].append(dict(plan['closure'],plan_id=pid))
+            occupancy(view,list(view['reservations'].values()),view['reservations'].keys())
             affected=set()
             for assignment in plan['assignments']:
                 old=state['reservations'][assignment['reference']]
@@ -1554,9 +1564,11 @@ def valid_snapshot(raw):
         if not isinstance(raw,dict):
             fail()
         if 'plans' not in raw and 'closures' not in raw:
-            return initialize_final(stage3_snapshot(raw))
+            migrated=initialize_revision_log(initialize_final(stage3_snapshot(raw)))
+            validate_revision_log(migrated)
+            return migrated
         required={'users','restaurants','reservations','tokens','receipts','policies','histories','series','restaurant_revisions','plans','closures'}
-        if set(raw)!=required or not isinstance(raw['plans'],dict) or not isinstance(raw['closures'],dict) or not isinstance(raw['receipts'],list):
+        if set(raw) not in (required,required|{'revision_log'}) or not isinstance(raw['plans'],dict) or not isinstance(raw['closures'],dict) or not isinstance(raw['receipts'],list):
             fail()
         core=copy.deepcopy({k:raw[k] for k in required-{'plans','closures'}})
         for entries in core['histories'].values():
@@ -1606,7 +1618,7 @@ def valid_snapshot(raw):
                 fail()
             interval(closure)
             context=plan['context']
-            if not isinstance(context,dict) or set(context)!={'reservations','closures'} or not isinstance(context['reservations'],dict) or not isinstance(context['closures'],list):
+            if not isinstance(context,dict) or set(context) not in ({'reservations','closures'},{'reservations','closures','checkpoint'}) or not isinstance(context['reservations'],dict) or not isinstance(context['closures'],list):
                 fail()
             for ref,b in context['reservations'].items():
                 if not isinstance(b,dict) or b.get('reference')!=ref or b.get('restaurant_id')!=rid or ref not in result['reservations']:
@@ -1708,12 +1720,164 @@ def valid_snapshot(raw):
                         current=result['reservations'][o['reference']]
                         if record['status']!='cancelled' or not json_equal(record,public_reservation(current)):
                             fail()
+        initialize_revision_log(result)
+        validate_revision_log(result)
+        for plan in result['plans'].values():
+            if not plan['applied'] and plan['restaurant_revision']==result['restaurant_revisions'][plan['restaurant_id']] and not plan_context_matches(result,plan):
+                fail()
         return result
     except (APIError,KeyError,TypeError,ValueError,OverflowError,AttributeError,IndexError):
         fail()
 
 
-STATE=initialize_final(STATE)
+
+def revision_checkpoint(state,rid):
+    return dict(reservations={ref:r['revision'] for ref,r in state['reservations'].items() if r['restaurant_id']==rid},
+                policies=len(state['policies'][rid]),
+                series={sid:s['revision'] for sid,s in state['series'].items() if state['reservations'][s['references'][0]]['restaurant_id']==rid},
+                plans=sorted(pid for pid,p in state.get('plans',{}).items() if p['restaurant_id']==rid and p['applied']))
+
+def validate_baseline_counter(state,rid,checkpoint,counter):
+    # Older formats do not distinguish individual writes from collective writes.
+    # Count mandatory operations and the possible groupings of recorded changes.
+    mandatory=checkpoint['policies']+len(checkpoint['series'])+len(checkpoint['plans'])
+    for receipt in state['receipts']:
+        if receipt['path']=='/reservations' and 'revision' in receipt['response'] and receipt['response']['reference'] in checkpoint['reservations']:
+            mandatory+=1
+    changes=[]
+    for ref,version in checkpoint['reservations'].items():
+        entries=state['histories'][ref][:version]
+        mandatory+=sum(e['event']=='cancelled' for e in entries)
+        changes.append(sum(e['event']=='changed' for e in entries))
+    if not mandatory+max(changes,default=0)<=counter<=mandatory+sum(changes):
+        fail()
+    for sid,revision in checkpoint['series'].items():
+        original=next(r['response'] for r in state['receipts'] if r['path']=='/series' and r['response']['series_id']==sid)
+        cancel_count=0;repair_ids=set();member_changes=[]
+        for occurrence in original['occurrences']:
+            ref=occurrence['reference'];initial=occurrence['reservation']['revision']
+            entries=state['histories'][ref][initial:checkpoint['reservations'][ref]]
+            cancel_count+=sum(e['event']=='cancelled' for e in entries)
+            repair_ids.update(e['plan_id'] for e in entries if e['event']=='reassigned')
+            member_changes.append(sum(e['event']=='changed' for e in entries))
+        minimum=1+cancel_count+len(repair_ids)+max(member_changes,default=0)
+        maximum=1+cancel_count+len(repair_ids)+sum(member_changes)
+        if not minimum<=revision<=maximum:
+            fail()
+
+def initialize_revision_log(state):
+    if 'revision_log' not in state:
+        state['revision_log']={rid:dict(base=state['restaurant_revisions'][rid],checkpoint=revision_checkpoint(state,rid),events=[]) for rid in state['restaurants']}
+    return state
+
+transaction_route=route
+
+def route(method,path,query,body,headers):
+    global STATE
+    before=STATE
+    try:
+        response=transaction_route(method,path,query,body,headers)
+        if method in ('POST','PATCH','PUT','DELETE') and path not in ('/_test/reset','/_test/import'):
+            for rid in STATE['restaurants']:
+                previous=before['restaurant_revisions'][rid];current=STATE['restaurant_revisions'][rid]
+                if current!=previous:
+                    if current!=previous+1:
+                        fail()
+                    old=revision_checkpoint(before,rid);new=revision_checkpoint(STATE,rid)
+                    event=dict(method=method,path=path,
+                               reservations={ref:rev for ref,rev in new['reservations'].items() if old['reservations'].get(ref)!=rev},
+                               policies=new['policies'],
+                               series={sid:rev for sid,rev in new['series'].items() if old['series'].get(sid)!=rev},
+                               plans=[pid for pid in new['plans'] if pid not in old['plans']])
+                    STATE['revision_log'][rid]['events'].append(event)
+        return response
+    except Exception:
+        STATE=before
+        raise
+
+def validate_revision_log(state):
+    logs=state['revision_log']
+    if not isinstance(logs,dict) or set(logs)!=set(state['restaurants']):
+        fail()
+    for rid,log in logs.items():
+        if not isinstance(log,dict) or set(log)!={'base','checkpoint','events'} or not isinstance(log['events'],list):
+            fail()
+        base=bounded(log['base'],0,float('inf'));checkpoint=copy.deepcopy(log['checkpoint'])
+        def check_point(c):
+            if not isinstance(c,dict) or set(c)!={'reservations','policies','series','plans'} or not isinstance(c['reservations'],dict) or not isinstance(c['series'],dict) or not isinstance(c['plans'],list) or len(c['plans'])!=len(set(c['plans'])):
+                fail()
+            bounded(c['policies'],0,len(state['policies'][rid]))
+            for ref,rev in c['reservations'].items():
+                if ref not in state['reservations'] or state['reservations'][ref]['restaurant_id']!=rid:
+                    fail()
+                bounded(rev,1,state['reservations'][ref]['revision'])
+            for sid,rev in c['series'].items():
+                if sid not in state['series'] or state['reservations'][state['series'][sid]['references'][0]]['restaurant_id']!=rid:
+                    fail()
+                bounded(rev,1,state['series'][sid]['revision'])
+            for pid in c['plans']:
+                if pid not in state['plans'] or state['plans'][pid]['restaurant_id']!=rid or not state['plans'][pid]['applied']:
+                    fail()
+        check_point(checkpoint);validate_baseline_counter(state,rid,checkpoint,base)
+        checkpoints={base:copy.deepcopy(checkpoint)}
+        for event in log['events']:
+            if not isinstance(event,dict) or set(event)!={'method','path','reservations','policies','series','plans'} or not isinstance(event['path'],str) or event['method'] not in ('POST','PATCH') or not isinstance(event['reservations'],dict) or not isinstance(event['series'],dict) or not isinstance(event['plans'],list):
+                fail()
+            old=copy.deepcopy(checkpoint)
+            for ref,rev in event['reservations'].items():
+                if type(rev) is not int or rev!=checkpoint['reservations'].get(ref,0)+1:
+                    fail()
+                checkpoint['reservations'][ref]=rev
+            for sid,rev in event['series'].items():
+                if type(rev) is not int or rev!=checkpoint['series'].get(sid,0)+1:
+                    fail()
+                checkpoint['series'][sid]=rev
+            if type(event['policies']) is not int or event['policies'] not in (checkpoint['policies'],checkpoint['policies']+1) or any(pid in checkpoint['plans'] for pid in event['plans']):
+                fail()
+            checkpoint['policies']=event['policies'];checkpoint['plans']=sorted(checkpoint['plans']+event['plans'])
+            check_point(checkpoint)
+            path=event['path'];refs=event['reservations']
+            events=[state['histories'][ref][rev-1]['event'] for ref,rev in refs.items()]
+            if path=='/reservations':
+                good=event['method']=='POST' and len(refs)==1 and events==['created']
+            elif path=='/series':
+                good=event['method']=='POST' and len(event['series'])==1 and all(e=='created' for e in events)
+            elif re.fullmatch(r'/restaurants/[^/]+/policies',path):
+                good=event['method']=='POST' and not refs and checkpoint['policies']==old['policies']+1
+            elif re.fullmatch(r'/restaurants/[^/]+/replans/[^/]+/apply',path):
+                good=event['method']=='POST' and len(event['plans'])==1 and all(e=='reassigned' for e in events)
+                plan=state['plans'][unquote(path.split('/')[4])]
+                good=good and event['plans']==[plan['plan_id']] and set(refs)=={a['reference'] for a in plan['assignments'] if a['changed']}
+            elif path=='/reservation-moves' or re.fullmatch(r'/series/[^/]+/amend',path):
+                good=event['method']=='POST' and bool(refs) and all(e=='changed' for e in events)
+            elif re.fullmatch(r'/reservations/[^/]+/cancel',path):
+                good=event['method']=='POST' and list(refs)==[unquote(path.split('/')[2])] and events==['cancelled']
+            elif re.fullmatch(r'/reservations/[^/]+',path):
+                good=event['method']=='PATCH' and list(refs)==[unquote(path.split('/')[2])] and events==['changed']
+            else:good=False
+            policy_change=checkpoint['policies']!=old['policies']
+            if not re.fullmatch(r'/restaurants/[^/]+/policies',path) and policy_change:
+                good=False
+            if not path.endswith('/apply') and event['plans']:
+                good=False
+            if path=='/series':
+                sid=next(iter(event['series']),None)
+                good=good and sid is not None and sid not in old['series'] and set(refs)==set(state['series'][sid]['references'][1:])
+            else:
+                affected={sid for sid,s in state['series'].items() if sid in old['series'] and set(refs)&set(s['references'])}
+                good=good and set(event['series'])==affected
+            checkpoints[base+len(checkpoints)]=copy.deepcopy(checkpoint)
+            if not good or json_equal(old,checkpoint):
+                fail()
+        for plan in state['plans'].values():
+            if plan['restaurant_id']==rid and 'checkpoint' in plan['context']:
+                expected=checkpoints.get(plan['restaurant_revision'])
+                if expected is None or not json_equal(plan['context']['checkpoint'],expected) or plan['context']['checkpoint']['reservations']!={ref:r['revision'] for ref,r in plan['context']['reservations'].items()}:
+                    fail()
+        if not json_equal(checkpoint,revision_checkpoint(state,rid)) or state['restaurant_revisions'][rid]!=base+len(log['events']):
+            fail()
+
+STATE=initialize_revision_log(initialize_final(STATE))
 
 if __name__ == "__main__":
     Server(("0.0.0.0", int(os.environ.get("PORT", "8080"))), Handler).serve_forever()
